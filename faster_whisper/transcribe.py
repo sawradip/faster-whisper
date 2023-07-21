@@ -83,6 +83,8 @@ class WhisperModel:
         num_workers: int = 1,
         download_root: Optional[str] = None,
         local_files_only: bool = False,
+        tokenizer_file = None,
+        tokenizer_obj = None,
     ):
         """Initializes the Whisper model.
 
@@ -130,8 +132,12 @@ class WhisperModel:
             inter_threads=num_workers,
         )
 
-        tokenizer_file = os.path.join(model_path, "tokenizer.json")
-        if os.path.isfile(tokenizer_file):
+
+        if tokenizer_obj:
+            self.hf_tokenizer = tokenizer_obj
+        elif os.path.isfile(tokenizer_file):
+            if not tokenizer_file:
+                tokenizer_file = os.path.join(model_path, "tokenizer.json")
             self.hf_tokenizer = tokenizers.Tokenizer.from_file(tokenizer_file)
         else:
             self.hf_tokenizer = tokenizers.Tokenizer.from_pretrained(
