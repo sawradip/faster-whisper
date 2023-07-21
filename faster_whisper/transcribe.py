@@ -131,13 +131,13 @@ class WhisperModel:
             intra_threads=cpu_threads,
             inter_threads=num_workers,
         )
-
-
+        
+        if not tokenizer_file:
+            tokenizer_file = os.path.join(model_path, "tokenizer.json")
+            
         if tokenizer_obj:
-            self.hf_tokenizer = tokenizer_obj
+            self.hf_tokenizer = tokenizer_obj        
         elif os.path.isfile(tokenizer_file):
-            if not tokenizer_file:
-                tokenizer_file = os.path.join(model_path, "tokenizer.json")
             self.hf_tokenizer = tokenizers.Tokenizer.from_file(tokenizer_file)
         else:
             self.hf_tokenizer = tokenizers.Tokenizer.from_pretrained(
