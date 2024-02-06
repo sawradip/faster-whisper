@@ -1,8 +1,10 @@
 import itertools
+import json
 import logging
 import os
 import zlib
 
+from inspect import signature
 from typing import BinaryIO, Iterable, List, NamedTuple, Optional, Tuple, Union
 
 import ctranslate2
@@ -11,7 +13,7 @@ import tokenizers
 
 from faster_whisper.audio import decode_audio
 from faster_whisper.feature_extractor import FeatureExtractor
-from faster_whisper.tokenizer import Tokenizer
+from faster_whisper.tokenizer import _LANGUAGE_CODES, Tokenizer
 from faster_whisper.utils import download_model, format_timestamp, get_logger
 from faster_whisper.vad import (
     SpeechTimestampsMap,
@@ -47,10 +49,13 @@ class TranscriptionOptions(NamedTuple):
     best_of: int
     patience: float
     length_penalty: float
+    repetition_penalty: float
+    no_repeat_ngram_size: int
     log_prob_threshold: Optional[float]
     no_speech_threshold: Optional[float]
     compression_ratio_threshold: Optional[float]
     condition_on_previous_text: bool
+    prompt_reset_on_temperature: float
     temperatures: List[float]
     initial_prompt: Optional[Union[str, Iterable[int]]]
     prefix: Optional[str]
@@ -61,12 +66,14 @@ class TranscriptionOptions(NamedTuple):
     word_timestamps: bool
     prepend_punctuations: str
     append_punctuations: str
+    max_new_tokens: Optional[int]
 
 
 class TranscriptionInfo(NamedTuple):
     language: str
     language_probability: float
     duration: float
+    duration_after_vad: float
     all_language_probs: Optional[List[Tuple[str, float]]]
     transcription_options: TranscriptionOptions
     vad_options: VadOptions
@@ -90,8 +97,8 @@ class WhisperModel:
 
         Args:
           model_size_or_path: Size of the model to use (tiny, tiny.en, base, base.en,
-            small, small.en, medium, medium.en, large-v1, or large-v2), a path to a converted
-            model directory, or a CTranslate2-converted Whisper model ID from the Hugging Face Hub.
+            small, small.en, medium, medium.en, large-v1, large-v2, large-v3, or large), a path to a
+            converted model directory, or a CTranslate2-converted Whisper model ID from the HF Hub.
             When a size or a model ID is configured, the converted model is downloaded
             from the Hugging Face Hub.
           device: Device to use for computation ("cpu", "cuda", "auto").
@@ -144,7 +151,8 @@ class WhisperModel:
                 "openai/whisper-tiny" + ("" if self.model.is_multilingual else ".en")
             )
 
-        self.feature_extractor = FeatureExtractor()
+        self.feat_kwargs = self._get_feature_kwargs(model_path)
+        self.feature_extractor = FeatureExtractor(**self.feat_kwargs)
         self.num_samples_per_token = self.feature_extractor.hop_length * 2
         self.frames_per_second = (
             self.feature_extractor.sampling_rate // self.feature_extractor.hop_length
@@ -156,6 +164,27 @@ class WhisperModel:
         self.time_precision = 0.02
         self.max_length = 448
 
+    @property
+    def supported_languages(self) -> List[str]:
+        """The languages supported by the model."""
+        return list(_LANGUAGE_CODES) if self.model.is_multilingual else ["en"]
+
+    def _get_feature_kwargs(self, model_path) -> dict:
+        preprocessor_config_file = os.path.join(model_path, "preprocessor_config.json")
+        config = {}
+        if os.path.isfile(preprocessor_config_file):
+            try:
+                with open(preprocessor_config_file, "r", encoding="utf-8") as json_file:
+                    config = json.load(json_file)
+                valid_keys = signature(FeatureExtractor.__init__).parameters.keys()
+                config = {k: v for k, v in config.items() if k in valid_keys}
+            except json.JSONDecodeError as e:
+                self.logger.warning(
+                    "Could not load preprocessor_config.json: %s", str(e)
+                )
+
+        return config
+
     def transcribe(
         self,
         audio: Union[str, BinaryIO, np.ndarray],
@@ -165,6 +194,8 @@ class WhisperModel:
         best_of: int = 5,
         patience: float = 1,
         length_penalty: float = 1,
+        repetition_penalty: float = 1,
+        no_repeat_ngram_size: int = 0,
         temperature: Union[float, List[float], Tuple[float, ...]] = [
             0.0,
             0.2,
@@ -177,6 +208,7 @@ class WhisperModel:
         log_prob_threshold: Optional[float] = -1.0,
         no_speech_threshold: Optional[float] = 0.6,
         condition_on_previous_text: bool = True,
+        prompt_reset_on_temperature: float = 0.5,
         initial_prompt: Optional[Union[str, Iterable[int]]] = None,
         prefix: Optional[str] = None,
         suppress_blank: bool = True,
@@ -188,6 +220,8 @@ class WhisperModel:
         append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
         vad_filter: bool = False,
         vad_parameters: Optional[Union[dict, VadOptions]] = None,
+        max_new_tokens: Optional[int] = None,
+        chunk_length: Optional[int] = None,
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """Transcribes an input file.
 
@@ -201,6 +235,9 @@ class WhisperModel:
           best_of: Number of candidates when sampling with non-zero temperature.
           patience: Beam search patience factor.
           length_penalty: Exponential length penalty constant.
+          repetition_penalty: Penalty applied to the score of previously generated tokens
+            (set > 1 to penalize).
+          no_repeat_ngram_size: Prevent repetitions of ngrams with this size (set 0 to disable).
           temperature: Temperature for sampling. It can be a tuple of temperatures,
             which will be successively used upon failures according to either
             `compression_ratio_threshold` or `log_prob_threshold`.
@@ -215,6 +252,8 @@ class WhisperModel:
             as a prompt for the next window; disabling may make the text inconsistent across
             windows, but the model becomes less prone to getting stuck in a failure loop,
             such as repetition looping or timestamps going out of sync.
+          prompt_reset_on_temperature: Resets prompt if temperature is above this value.
+            Arg has effect only if condition_on_previous_text is True.
           initial_prompt: Optional text string or iterable of token ids to provide as a
             prompt for the first window.
           prefix: Optional text to provide as a prefix for the first window.
@@ -234,6 +273,10 @@ class WhisperModel:
             https://github.com/snakers4/silero-vad.
           vad_parameters: Dictionary of Silero VAD parameters or VadOptions class (see available
             parameters and default values in the class `VadOptions`).
+          max_new_tokens: Maximum number of new tokens to generate per-chunk. If not set,
+            the maximum will be set by the default max_length.
+          chunk_length: The length of audio segments. If it is not None, it will overwrite the
+            default chunk_length of the FeatureExtractor.
 
         Returns:
           A tuple with:
@@ -247,6 +290,7 @@ class WhisperModel:
             audio = decode_audio(audio, sampling_rate=sampling_rate)
 
         duration = audio.shape[0] / sampling_rate
+        duration_after_vad = duration
 
         self.logger.info(
             "Processing audio with duration %s", format_timestamp(duration)
@@ -259,10 +303,11 @@ class WhisperModel:
                 vad_parameters = VadOptions(**vad_parameters)
             speech_chunks = get_speech_timestamps(audio, vad_parameters)
             audio = collect_chunks(audio, speech_chunks)
+            duration_after_vad = audio.shape[0] / sampling_rate
 
             self.logger.info(
                 "VAD filter removed %s of audio",
-                format_timestamp(duration - (audio.shape[0] / sampling_rate)),
+                format_timestamp(duration - duration_after_vad),
             )
 
             if self.logger.isEnabledFor(logging.DEBUG):
@@ -281,7 +326,7 @@ class WhisperModel:
         else:
             speech_chunks = None
 
-        features = self.feature_extractor(audio)
+        features = self.feature_extractor(audio, chunk_length=chunk_length)
 
         encoder_output = None
         all_language_probs = None
@@ -307,6 +352,13 @@ class WhisperModel:
                     language_probability,
                 )
         else:
+            if not self.model.is_multilingual and language != "en":
+                self.logger.warning(
+                    "The current model is English-only but the language parameter is set to '%s'; "
+                    "using 'en' instead." % language
+                )
+                language = "en"
+
             language_probability = 1
 
         tokenizer = Tokenizer(
@@ -321,10 +373,13 @@ class WhisperModel:
             best_of=best_of,
             patience=patience,
             length_penalty=length_penalty,
+            repetition_penalty=repetition_penalty,
+            no_repeat_ngram_size=no_repeat_ngram_size,
             log_prob_threshold=log_prob_threshold,
             no_speech_threshold=no_speech_threshold,
             compression_ratio_threshold=compression_ratio_threshold,
             condition_on_previous_text=condition_on_previous_text,
+            prompt_reset_on_temperature=prompt_reset_on_temperature,
             temperatures=(
                 temperature if isinstance(temperature, (list, tuple)) else [temperature]
             ),
@@ -337,6 +392,7 @@ class WhisperModel:
             word_timestamps=word_timestamps,
             prepend_punctuations=prepend_punctuations,
             append_punctuations=append_punctuations,
+            max_new_tokens=max_new_tokens,
         )
 
         segments = self.generate_segments(features, tokenizer, options, encoder_output)
@@ -348,6 +404,7 @@ class WhisperModel:
             language=language,
             language_probability=language_probability,
             duration=duration,
+            duration_after_vad=duration_after_vad,
             transcription_options=options,
             vad_options=vad_parameters,
             all_language_probs=all_language_probs,
@@ -398,7 +455,7 @@ class WhisperModel:
                 prefix=options.prefix if seek == 0 else None,
             )
 
-            if encoder_output is None:
+            if seek > 0 or encoder_output is None:
                 encoder_output = self.encode(segment)
 
             (
@@ -534,8 +591,6 @@ class WhisperModel:
                     if seek_shift > 0:
                         seek = previous_seek + seek_shift
 
-            encoder_output = None
-
             for segment in current_segments:
                 tokens = segment["tokens"]
                 text = tokenizer.decode(tokens)
@@ -564,7 +619,17 @@ class WhisperModel:
                     ),
                 )
 
-            if not options.condition_on_previous_text or temperature > 0.5:
+            if (
+                not options.condition_on_previous_text
+                or temperature > options.prompt_reset_on_temperature
+            ):
+                if options.condition_on_previous_text:
+                    self.logger.debug(
+                        "Reset prompt. prompt_reset_on_temperature threshold is met %f > %f",
+                        temperature,
+                        options.prompt_reset_on_temperature,
+                    )
+
                 prompt_reset_since = len(all_tokens)
 
     def encode(self, features: np.ndarray) -> ctranslate2.StorageView:
@@ -591,6 +656,21 @@ class WhisperModel:
         max_initial_timestamp_index = int(
             round(options.max_initial_timestamp / self.time_precision)
         )
+        if options.max_new_tokens is not None:
+            max_length = len(prompt) + options.max_new_tokens
+        else:
+            max_length = self.max_length
+
+        if max_length > self.max_length:
+            raise ValueError(
+                f"The length of the prompt is {len(prompt)}, and the `max_new_tokens` "
+                f"{max_length - len(prompt)}. Thus, the combined length of the prompt "
+                f"and `max_new_tokens` is: {max_length}. This exceeds the "
+                f"`max_length` of the Whisper model: {self.max_length}. "
+                "You should either reduce the length of your prompt, or "
+                "reduce the value of `max_new_tokens`, "
+                f"so that their combined length is less that {self.max_length}."
+            )
 
         for temperature in options.temperatures:
             if temperature > 0:
@@ -610,7 +690,9 @@ class WhisperModel:
                 encoder_output,
                 [prompt],
                 length_penalty=options.length_penalty,
-                max_length=self.max_length,
+                repetition_penalty=options.repetition_penalty,
+                no_repeat_ngram_size=options.no_repeat_ngram_size,
+                max_length=max_length,
                 return_scores=True,
                 return_no_speech_prob=True,
                 suppress_blank=options.suppress_blank,
@@ -668,6 +750,8 @@ class WhisperModel:
             if (
                 options.no_speech_threshold is not None
                 and result.no_speech_prob > options.no_speech_threshold
+                and options.log_prob_threshold is not None
+                and avg_logprob < options.log_prob_threshold
             ):
                 needs_fallback = False  # silence
 
@@ -677,6 +761,13 @@ class WhisperModel:
             # all failed, select the result with the highest average log probability
             decode_result = max(
                 below_cr_threshold_results or all_results, key=lambda x: x[1]
+            )
+            # to pass final temperature for prompt_reset_on_temperature
+            decode_result = (
+                decode_result[0],
+                decode_result[1],
+                temperature,
+                decode_result[3],
             )
 
         return decode_result
@@ -718,7 +809,7 @@ class WhisperModel:
         prepend_punctuations: str,
         append_punctuations: str,
         last_speech_timestamp: float,
-    ):
+    ) -> None:
         if len(segments) == 0:
             return
 
@@ -855,6 +946,13 @@ class WhisperModel:
         words, word_tokens = tokenizer.split_to_word_tokens(
             text_tokens + [tokenizer.eot]
         )
+        if len(word_tokens) <= 1:
+            # return on eot only
+            # >>> np.pad([], (1, 0))
+            # array([0.])
+            # This results in crashes when we lookup jump_times with float, like
+            # IndexError: arrays used as indices must be of integer (or boolean) type
+            return []
         word_boundaries = np.pad(np.cumsum([len(t) for t in word_tokens[:-1]]), (1, 0))
         if len(word_boundaries) <= 1:
             return []
@@ -924,7 +1022,10 @@ def get_compression_ratio(text: str) -> float:
     return len(text_bytes) / len(zlib.compress(text_bytes))
 
 
-def get_suppressed_tokens(tokenizer, suppress_tokens):
+def get_suppressed_tokens(
+    tokenizer: Tokenizer,
+    suppress_tokens: Optional[List[int]],
+) -> Optional[List[int]]:
     if not suppress_tokens or -1 in suppress_tokens:
         return suppress_tokens
 
@@ -945,7 +1046,7 @@ def get_suppressed_tokens(tokenizer, suppress_tokens):
     return sorted(set(suppress_tokens))
 
 
-def merge_punctuations(alignment: List[dict], prepended: str, appended: str):
+def merge_punctuations(alignment: List[dict], prepended: str, appended: str) -> None:
     # merge prepended punctuations
     i = len(alignment) - 2
     j = len(alignment) - 1
