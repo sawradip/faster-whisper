@@ -48,6 +48,7 @@ def download_model(
     output_dir: Optional[str] = None,
     local_files_only: bool = False,
     cache_dir: Optional[str] = None,
+    hf_token: Optional[str] = None,
 ):
     """Downloads a CTranslate2 Whisper model from the Hugging Face Hub.
 
@@ -91,6 +92,8 @@ def download_model(
         "allow_patterns": allow_patterns,
         "tqdm_class": disabled_tqdm,
     }
+    if hf_token is not None:
+        kwargs["token"] = hf_token
 
     if output_dir is not None:
         kwargs["local_dir"] = output_dir
