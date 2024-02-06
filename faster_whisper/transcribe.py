@@ -92,6 +92,7 @@ class WhisperModel:
         local_files_only: bool = False,
         tokenizer_file = None,
         tokenizer_obj = None,
+        hf_token = None
     ):
         """Initializes the Whisper model.
 
@@ -128,6 +129,7 @@ class WhisperModel:
                 model_size_or_path,
                 local_files_only=local_files_only,
                 cache_dir=download_root,
+                hf_token=hf_token,
             )
 
         self.model = ctranslate2.models.Whisper(
